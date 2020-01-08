@@ -1,0 +1,91 @@
+{-# LANGUAGE OverloadedStrings, DeriveAnyClass, DeriveGeneric #-}
+
+--module JSeMtrain where
+
+import System.FilePath ((</>),(<.>))     --filepath
+import qualified Data.Text as StrictT    --text
+import qualified Data.Text.IO as StrictT --text
+import qualified Data.Text.Lazy    as T  --text
+import qualified Data.Text.Lazy.IO as T  --text
+import qualified Data.Aeson as A         --aeson
+import qualified DyNet.Core as D         --dynet-haskell
+import qualified DyNet.Expr as D         --dynet-haskell
+import qualified DyNet.RNN as D          --dynet-haskell
+import qualified DyNet.Dict as D         --dynet-haskell
+import qualified DyNet.Train as D        --dynet-haskell
+import qualified DyNet.Tools.Juman as Juman --dynet-tools
+import qualified DyNet.Tools.Chart as D     --dynet-tools
+import qualified DyNet.Simple as D          --dynet-tools
+import qualified JSeM as J                  --jsem
+import qualified JSeM.XML as J              --jsem
+import DyNet.Simple.LSTMclassifier          --dynet-tools
+
+main :: IO ()
+main = do
+  -- | 初期化。引数は捨てる。
+  _ <- D.setup
+  -- | 変数の宣言。
+  let homedir = "/home/bekki/program/dynet-tools"
+      jsemfile = "/home/bekki/program/jsem/data/JSeM_beta_150415.xml"
+      datadir = homedir </> "app" </> "jsem" </> "jsem_data"
+      savedir = homedir </> "app" </> "jsem" </> "jsem_models"
+  -- | jsemfileを読み込み、XML形式データをパーズし[JSeM.JSeMdata]に。
+  jsemdata <- StrictT.readFile jsemfile >>= J.xml2jsemData
+  --let (ans,premises,hypos) = unzip3 $ map (\j -> (JSeM.answer j, T.concat $ JSeM.premise j, JSeM.hypothesis j)) jsemdata
+  let (ans,premises,hypos) = unzip3 $ do
+                                      j <- jsemdata
+                                      return (J.answer j, StrictT.concat $ J.premises j, J.hypothesis j)
+      -- | 解答のリスト:[Label]を作る。
+      allAnswers = do
+                   a <- ans
+                   return $ case a of
+                              J.YES -> StrictT.pack "YES"
+                              J.NO ->  StrictT.pack "NO"
+                              J.UNKNOWN -> StrictT.pack "UNKNOWN"
+                              J.UNDEF ->   StrictT.pack "UNKNOWN"
+  -- | 入力データをJUMANで形態素解析。各行 -> [(ある,同士),(イタリア,名詞),...]
+  allPremises <- Juman.processTextsByJuman (datadir  </> "juman_premises.txt") premises
+  allHypos    <- Juman.processTextsByJuman (datadir </> "juman_hypos.txt") hypos 
+  -- | 全形態素解析結果から、表層形と品詞のそれぞれについて辞書を作る（頻度がthreshold以下は捨てる）
+  let (allwords,allposs) = Juman.buildDictionary (allPremises ++ allHypos) [] -- ([ある,イタリア,...],[動詞,名詞,...])
+      threshold = 2
+      freqwords = Juman.cutLessFreqWords threshold allwords
+      freqposs  = Juman.cutLessFreqWords threshold allposs
+  -- | ここまで前処理、ここからDyNet.hsによるニューラルネットの準備
+  D.gridsearch $ do -- Grid Search
+    -- | ハイパーパラメータ
+    numOfLSTMlayers <- [1]
+    wordEmbedDim <- [128]
+    posEmbedDim <- [10]
+    lstmDim <- [256]
+    hidden1Dim <- [410]
+    hidden2Dim <- [90]
+    iter <- [40]
+    batchSize <- [264]
+    return $ do
+      -- | Grid search開始。ハイパーパラメータを設定。
+      let hyperParams = HyperParams numOfLSTMlayers wordEmbedDim posEmbedDim lstmDim hidden1Dim hidden2Dim iter batchSize freqwords freqposs jsemlabels
+          setting = showHyperParams hyperParams
+      -- | ハイパーパラメータをjson形式で保存。
+      A.encodeFile (savedir </> setting <.> "json") hyperParams 
+      putStrLn $ "Grid: " ++ setting
+      -- | モデルを用意。ハイパーパラメータを元にパラメータを設定
+      model <- D.createModel
+      params <- setLSTMparams model hyperParams
+      -- | データをk-foldで訓練データとテストデータに分割
+      let (trainData,testData) = D.kfold 3 $ zip (zip allPremises allHypos) allAnswers
+      -- | 学習。訓練器を作りtrainに渡す。返り値はloss/epochの表データで、drawLearningCurveでグラフ化してpng保存。
+      D.createAdamTrainer' model  -- ToDo: AdamTrainerとは？それ以外の選択肢は？
+        >>= D.train iter batchSize trainData (buildClassifier params) (labels params)
+        >>= D.drawLearningCurve (savedir </> setting <.> "png") ("Grid-" ++ setting) 
+      -- | 評価。返り値はoverall accuracy
+      accuracy <- D.evaluate testData (buildClassifier params) (labels params) jsemlabels
+      -- | モデルを保存。ハイパーパラメータの値からファイル名を作る
+      D.saveModel model $ savedir </> setting <.> "model"
+      -- | model:D.Model, setting:String, Accuracy:Float の三つ組を返す。
+      return (model, setting, accuracy)
+
+-- | 現在のベストスコア
+-- Accuracy: 0.78707224 Setting: 1-128-10-256-410-90-22-264
+-- Accuracy: 0.7794677  Setting: 1-128-10-256-412-88-20-100
+-- Accuracy: 0.7794677  Setting: 1-128-10-256-410-90-20-100

@@ -1,0 +1,215 @@
+{-# OPTIONS -Wall #-}
+{-# LANGUAGE OverloadedStrings, ExtendedDefaultRules #-}
+{-# OPTIONS_GHC -fno-warn-type-defaults #-}
+
+module DyNet.Tools.Juman (
+  JumanEntry (..),
+  Kihon,
+  Hinsi,
+  processTextsByJuman,
+  processTextByJumanOnline,
+  buildDictionary,
+  cutLessFreqWords
+  --juman2tensor,
+  --unzipJumanTensorWithMask,
+  --jumanTensor2BagOfWords,
+  --printJumanTensorParams,
+  ) where
+
+--import System.FilePath ((</>)) --filepath
+import Control.Monad (guard,forM)  --base
+--import qualified System.IO as IO   --base
+import qualified Data.List as L    --base
+import qualified Shelly as S       --shelly
+import qualified Data.Text as T    --text
+--import qualified Data.Text.IO as T --text
+import qualified DyNet.Tools.Utils as U  --dynet-tools
+default (T.Text)
+
+data JumanEntry = JumanEntry {
+  hyoso :: T.Text,
+  yomi :: T.Text,
+  kihon :: T.Text,
+  pos :: T.Text,
+  subpos :: T.Text
+  } | EOS | Error T.Text deriving (Eq, Show)
+
+-- | takes a text, process it with JUMAN, and returns the result.  Used internally.
+callJuman :: T.Text -> S.Sh T.Text
+callJuman text = S.silently $ S.escaping False $ S.cmd $ S.fromText $ T.concat ["echo ", purifyText text, " | juman"]
+  where purifyText tx = -- | removes occurrences of non-letters from an input text.  
+          case T.uncons tx of -- remove a non-literal symbol at the beginning of a sentence (if any)
+            Nothing -> T.empty
+            Just (c,t) | T.any (==c) "("          -> T.cons '（' $ purifyText t
+                       | T.any (==c) ")"          -> T.cons '）' $ purifyText t
+                       | T.any (==c) ","          -> T.cons '，' $ purifyText t
+                       | T.any (==c) "#"          -> T.cons '＃' $ purifyText t
+                       | T.any (==c) "`'^><_&;\\" -> T.cons '*'  $ purifyText t  -- ignore meaningless symbols
+                       | otherwise                -> T.cons c    $ purifyText t
+
+callJuman' :: T.Text -> S.Sh [JumanEntry]
+callJuman' text = do
+  jumanlines <- T.lines <$> callJuman text
+  return $ map jumanOutput2Entry $ L.filter (\t -> not $ T.isPrefixOf "@" t) jumanlines
+
+type Kihon = T.Text
+type Hinsi = T.Text
+
+-- | takes a filepath and a list of texts,
+--   process each text with `callJuman',
+--   and write the result in a specified fiie (unless it already exists)
+processTextsByJuman :: FilePath -> [T.Text] -> IO [[(Kihon, Hinsi)]]
+processTextsByJuman filepathname texts = S.shelly $ do
+  let filepath = S.fromText $ T.pack filepathname
+      for = flip map
+  exist <- S.test_f filepath
+  if exist -- if the file already exists 
+     then do
+          S.echo_n_err $ T.pack $ filepathname ++ " found. To re-run juman, delete " ++ filepathname ++ " and run the program again.\n"
+          -- "k1#p1,...,kn#pn \n k1#p1,...,kn#pn \n ..." >>= ["k1#p1,...,kn#pn", "k1#p1,...,kn#pn", ...]
+          lins <- T.lines <$> S.readfile filepath
+          return $ for lins $ \line -> do
+                                pairs <- T.split (==',') line
+                                let (k:p:_) = T.split (=='#') pairs
+                                return (k,p)
+     else do
+          S.echo_n_err $ T.pack $ show (length texts) ++ " texts processed.\n"
+          forM texts $ \tx -> do
+                         jumanentries <- callJuman' tx
+                         S.appendfile filepath $ T.snoc (T.intercalate "," $ map encodeJumanEntry jumanentries) '\n'
+                         S.echo_n_err "o" 
+                         return $ map jumanEntry2Pair jumanentries 
+
+processTextByJumanOnline :: T.Text -> IO [(Kihon, Hinsi)]
+processTextByJumanOnline text =
+  S.shelly $ do
+             j <- callJuman' text
+             return $ map jumanEntry2Pair j
+
+jumanOutput2Entry :: T.Text -> JumanEntry
+jumanOutput2Entry tx 
+  | tx == "EOS" = EOS
+  | otherwise = let ts = T.split (==' ') tx in
+                  if length ts < 6
+                     then Error tx
+                     else JumanEntry {hyoso=ts!!0, yomi=ts!!1, kihon=ts!!2, pos=ts!!3, subpos=ts!!5}
+
+encodeJumanEntry :: JumanEntry -> T.Text
+encodeJumanEntry j = case j of
+  JumanEntry _ _ _ _ _ -> T.concat [kihon j, "#", pos j]
+  EOS                  -> "EOS#EOS"
+  Error t              -> T.concat ["error#",t]
+
+jumanEntry2Pair :: JumanEntry -> (Kihon, Hinsi)
+jumanEntry2Pair je = case je of
+                       JumanEntry _ _ _ _ _ -> (kihon je, pos je)
+                       EOS                  -> ("EOS","EOS")
+                       Error t              -> (t,"ERROR")
+
+-- | Create a pair (or a tuple) of sorted labels from juman-processed texts
+--   ([k1,...,kn],[p1,...,pn])
+buildDictionary :: [[(Kihon, Hinsi)]]    -- ^ All the juman output texts: ["k1#p1,...,kn#pn","k1#p1,...,kn#pn",...]
+                   -> [Hinsi] -- ^ poss to use.  when posfilter==[], all poss are used.
+                   -> ([Kihon],[Hinsi])
+buildDictionary allResults posfilter =
+  unzip $ do                      -- list monad
+          oneResult <- allResults -- [(k1,p1),...,(kn,pn)]
+          (k,p)     <- oneResult  -- (k1,p1)
+          S.when (posfilter /= []) $ guard $ L.elem p posfilter         -- Only considers elements specified in posfilter
+          return (k,p)                           -- [(k1,p1),...,(kn,pn)]
+
+-- | Remove (from a given list) elements whose occurrence is equal or less than the threshold
+cutLessFreqWords :: Int      -- ^ The minimum number of occurences of a word (otherwise the word is ignored)
+                 -> [T.Text] -- ^ a list of words
+                 -> [T.Text]
+cutLessFreqWords threshold wds = fst $ unzip $ reverse $ L.sortOn snd $ U.toList $ U.filterHistByValue (>= threshold) $ U.pushWords wds
+
+{-
+
+-- | transforms a list of texts to a list of tensors (to be fed to neural networks)
+juman2tensor :: Bool                  -- ^ True for verbose mode, False for silent mode
+               -> Int                 -- ^ The minimum number of occurences of a word (otherwise the word is ignored)
+               -> ([Kihon],[Hinsi]) -- ^ dictionary (sorted all kihon, sorted all pos)
+               -> [[(Kihon, Hinsi)]]            -- ^ A juman output texts to transform into tensors
+               -> IO(Int,Int,Int,[[(Int,Int)]])
+juman2tensor _ threshold (all_kihon,all_pos) jumanResults = do -- IO monad
+  -- filter (\p -> snd p /= "未定義語") 
+  let kihon_all_sorted = cutByThreshold all_kihon
+      pos_all_sorted   = cutByThreshold all_pos
+      jumanEntries = do
+                     oneResult <- jumanResults                 -- [(k1,p1),...,(kn,pn)]
+                     return $ do
+                              (k,p) <- oneResult
+                              (i,_) <- U.fetchIndex kihon_all_sorted k
+                              (j,_) <- U.fetchIndex pos_all_sorted p
+                              return (i,j) -- [(k1,p1),...,(kn,pn)]
+  --IO.withFile (datadir </> datafilename ++ "_kihon_all_sorted.txt") IO.WriteMode (\h -> mapM_ (printPair h) kihon_all_sorted)
+  --IO.withFile (datadir </> datafilename ++ "_pos_all_sorted.txt") IO.WriteMode (\h -> mapM_ (printPair h) pos_all_sorted)
+  return (length kihon_all_sorted,
+          length pos_all_sorted,
+          maximum $ map length jumanEntries,
+          jumanEntries)
+  where cutByThreshold wds = reverse $ L.sortOn snd $ U.toList $ U.filterHistByValue (>= threshold) $ U.pushWords wds
+
+unzipJumanTensorWithMask :: FilePath         -- ^ path of directory to save data files
+                    -> String        -- ^ filename
+                    -> Int
+                    -> [[(Int,Int)]] -- ^ A list of (kihon index, pos index)
+                    -> IO(String,String)
+unzipJumanTensorWithMask datadir datafilename maxlength jumanEntries = do
+  let kihonFileName = datafilename ++ "_kihon.txt"
+      posFileName = datafilename ++ "_pos.txt" 
+  IO.withFile (datadir </> kihonFileName) IO.WriteMode (\hk ->
+    IO.withFile (datadir </> posFileName) IO.WriteMode (\hp ->
+      mapM_ (\jumanEntry -> do -- [(Int,Int)]
+        let kp = unzip jumanEntry -- ([Int],[Int])
+            k = fst kp            -- [Int]
+            p = snd kp            -- [Int]
+        T.hPutStrLn hk $ T.intercalate "," $ map (T.pack . show) k ++ replicate (maxlength-(length k)) "0"
+        T.hPutStrLn hp $ T.intercalate "," $ map (T.pack . show) p ++ replicate (maxlength-(length p)) "0"
+        ) jumanEntries
+      )
+    )
+  return (kihonFileName, posFileName)
+
+jumanTensor2BagOfWords :: FilePath       -- ^ path of directory to save data files
+                          -> String      -- ^ filename
+                          -> Int
+                          -> Int
+                          -> [[(Int,Int)]] -- ^ A list of (kihon index, pos index)
+                          -> IO(String)
+jumanTensor2BagOfWords datadir datafilename kihonkeiNum hinsiNum jumanEntries = do
+  IO.withFile (datadir </> datafilename) IO.WriteMode (\h ->
+    mapM_ (\jumanEntry -> do -- [(Int,Int)]
+            let kp = unzip jumanEntry -- ([Int],[Int])
+                k_hist = U.pushWords $ fst kp
+                --p_hist = U.pushWords $ snd kp
+                k_bow  = map (\i -> case U.lookup i k_hist of
+                                      Just j -> show j
+                                      Nothing -> "0") [1..kihonkeiNum]
+                --p_bow = map (\i -> case U.lookup i p_hist of
+                --                      Just j -> show j
+                --                      Nothing -> "0") [1..hinsiNum]
+            IO.hPutStrLn h $ L.intercalate "," k_bow
+          ) jumanEntries
+    )
+  return datafilename
+
+{-
+printPair :: IO.Handle -> (T.Text,Int) -> IO()
+printPair h (text,i) = do
+  T.hPutStr h text
+  IO.hPutStrLn h $ "," ++ show i
+-}
+
+printJumanTensorParams :: IO.Handle -> (Int,Int,Int) -> IO()
+printJumanTensorParams h (kihonkei_num, hinsi_num, maxlength) = do
+  IO.hPutStr   h "Number of unique kihonkei: "
+  IO.hPutStrLn h $ show kihonkei_num
+  IO.hPutStr   h "Number of unique hinshi: "
+  IO.hPutStrLn h $ show hinsi_num
+  IO.hPutStr   h "Maxumum number of words: "
+  IO.hPutStrLn h $ show $ maxlength
+
+-}
+

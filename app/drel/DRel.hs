@@ -1,0 +1,120 @@
+{-# LANGUAGE OverloadedStrings #-}
+
+module DRel where
+
+import Control.Monad ( forM, forM_, liftM )
+import qualified System.Environment as E -- base
+import qualified Data.Text as T          -- text
+import qualified Data.Text.IO as T       -- text
+import qualified DNN.Utils as U          -- keras-dnn
+import qualified DyNet.Core as Core      -- DyNet
+import qualified DyNet.Expr as Expr      -- DyNet
+import qualified DyNet.Train as Train    -- DyNet
+--import qualified DyNet.IO as IO          -- DyNet
+import qualified DyNet.Vector as Vec     -- DyNet
+
+-- | prepares a float vector of dimension dim
+zeroVector :: Int -> IO (Vec.Vector Float)
+zeroVector dim = Vec.fromList (take dim $ repeat $ (0::Float))
+
+-- | converts Data.Text to Float
+text2float :: T.Text -> Float
+text2float text = (read $ T.unpack text)::Float
+
+-- | sets a value (a list of Data.Texst) of a (pointer to a) vector vec
+setValue :: (Vec.Vector Float) -> [T.Text] -> IO()
+setValue vec vals = mapM_ (\(val,ind) -> Vec.insert vec ind $ text2float val) $ zip vals [0..]
+
+-- | converts a list of floats so that a float greater than a given threshold is True, and False otherwise.
+--screen :: Float -> [Float] -> [Bool]
+--screen threshold = map (>= threshold)
+
+main :: IO()
+main = do
+  let hidden_dim1 = 100
+      epochs = 100::Int
+      --threshold = 0.55::Float
+  argv <- do
+          a <- E.getArgs
+          Core.initialize' a
+  model <- Core.createModel
+  trainer <- Train.createSimpleSGDTrainer model 0.1 0.0
+
+  datadirroot <- U.getPath
+  let datadir = datadirroot ++ "app/DRel/data/"
+      
+  feat_train    <- U.openCSV "," $ datadir ++ "feat_train.txt"
+  feat_test     <- U.openCSV "," $ datadir ++ "feat_test.txt"
+  words_train   <- U.openCSV "," $ datadir ++ "words_train.txt"
+  words_test    <- U.openCSV "," $ datadir ++ "words_test.txt"
+  predrel_train <- U.openCSV "," $ datadir ++ "predrel_train.txt"
+  predrel_test  <- U.openCSV "," $ datadir ++ "predrel_test.txt"
+  drel_train    <- U.openCSV "," $ datadir ++ "drel_train.txt"
+  drel_test     <- U.openCSV "," $ datadir ++ "drel_test.txt"
+  drel_labels   <- liftM T.lines $ T.readFile $ datadir ++ "drel.txt.sorted"
+  
+  let feat_dim = length $ head feat_train
+      words_dim = length $ head words_train
+      predrel_dim = length $ head predrel_train
+      drel_dim = length $ head drel_train
+
+  -- print_ =<< getDim h
+  
+  p_W1 <- Core.addParameters' model [hidden_dim1, feat_dim+predrel_dim]
+  p_b1 <- Core.addParameters' model [hidden_dim1]
+  p_W2 <- Core.addParameters' model [drel_dim, hidden_dim1]
+  p_b2 <- Core.addParameters' model [drel_dim]
+  p_emb <- Core.addLookupParameters' model 0 (256::Vec.Int64)
+
+  Core.withNewComputationGraph $ \cg -> do
+    -- | 入力層
+    fVals <- zeroVector feat_dim
+    f <- Expr.input cg [feat_dim] fVals
+    pVals <- zeroVector predrel_dim
+    p <- Expr.input cg [predrel_dim] pVals
+    x <- Expr.concat' [f,p]
+    Core.print_ =<< Core.getDim f
+    Core.print_ =<< Core.getDim p
+    Core.print_ =<< Core.getDim x
+    -- | 出力層
+    yVals <- zeroVector feat_dim
+    y <- Expr.input cg [drel_dim] yVals
+    -- | １層目
+    _W1 <- Expr.parameter cg p_W1
+    b1 <- Expr.parameter cg p_b1
+    h1 <- Expr.selu $ _W1 `Expr.mul` x `Expr.add` b1
+    -- | ２層目
+    _W2 <- Expr.parameter cg p_W2
+    -- b2 <- Expr.parameter cg p_b2
+    y_hat <- Expr.logistic $ _W2 `Expr.mul` h1 -- `Expr.add` b2
+    lossExp <- Expr.squaredDistance y_hat y
+    -- | Training
+    _ <- forM [1..epochs] $ \epoch -> do
+           loss' <- forM (zip3 feat_train predrel_train drel_train) $ \(feat,predrel,drel) -> do
+             setValue fVals feat
+             setValue pVals predrel
+             setValue yVals drel
+             loss <- Core.asScalar =<< Core.forward cg lossExp
+             Core.backward cg lossExp
+             Train.update trainer 1.0
+             return loss
+           putStrLn $ "Epoch " ++ show epoch
+                      ++ ": Average loss = " ++ show ((sum loss') / (realToFrac $ length loss'))
+    -- | Test
+    y_hatT <- forM (zip feat_test predrel_test) $ \(feat,predrel) -> do
+                setValue fVals feat
+                setValue pVals predrel
+                Vec.toList =<< Core.asVector =<< Core.forward cg y_hat
+    forM_ [0.1, 0.2, 0.28, 0.29, 0.3, 0.31, 0.32, 0.33, 0.4, 0.5, 0.52, 0.55, 0.57, 0.6, 0.7, 0.8, 0.9] $ \threshold -> do 
+      result <- U.initializeMultilabelResult
+                   drel_labels
+                   (map (map (>= threshold)) y_hatT)
+                   (map (map ((>= 1.0) . text2float)) drel_test)
+    --print $ U.classificationResult result
+      putStrLn $ "Threshold: " ++ (show threshold)
+               ++ ", Accuracy: " ++ (show $ U.accuracy result)
+               ++ ", Precision: " ++ (show $ U.precision result)
+               ++ ", Recall: " ++ (show $ U.recall result)
+               ++ ", F1: " ++ (show $ U.f1 result)
+
+
