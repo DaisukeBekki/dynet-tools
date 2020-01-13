@@ -2,11 +2,10 @@ extra-deps:
   - network-2.6.3.5
   - git: https://github.com/masashi-y/optparse-declarative.git
     commit: a77c0e6917528e5fad83a4e03f98ea7727f103c8
-  - git: https://github.com/DaisukeBekki/dynet.hs.git
-    commit: 0b79d640ac5ee71ff740619fb0a9a3594e4bbc4e
+  - /home/bekki/.local/lib/dynet.hs
+  #- git: https://github.com/DaisukeBekki/dynet.hs.git
+  #  commit: 0b79d640ac5ee71ff740619fb0a9a3594e4bbc4e
   - git: https://github.com/DaisukeBekki/JSeM.git
-    commit: 3a880f3db35f7b44f18067e64520ccd74856193c
- 
+    commit: be59964541248fd9327f1f5af30d62d15987c21b
 flags: {}
-
 resolver: lts-14.1

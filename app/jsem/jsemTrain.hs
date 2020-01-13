@@ -30,7 +30,7 @@ main = do
       datadir = homedir </> "app" </> "jsem" </> "jsem_data"
       savedir = homedir </> "app" </> "jsem" </> "jsem_models"
   -- | jsemfileを読み込み、XML形式データをパーズし[JSeM.JSeMdata]に。
-  jsemdata <- StrictT.readFile jsemfile >>= J.xml2jsemData
+  jsemdata <- J.xmlFile2jsemData jsemfile
   --let (ans,premises,hypos) = unzip3 $ map (\j -> (JSeM.answer j, T.concat $ JSeM.premise j, JSeM.hypothesis j)) jsemdata
   let (ans,premises,hypos) = unzip3 $ do
                                       j <- jsemdata
