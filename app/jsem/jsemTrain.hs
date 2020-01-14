@@ -55,12 +55,12 @@ main = do
   D.gridsearch $ do -- Grid Search
     -- | ハイパーパラメータ
     numOfLSTMlayers <- [1]
-    wordEmbedDim <- [128]
+    wordEmbedDim <- [128,256]
     posEmbedDim <- [10]
-    lstmDim <- [256]
-    hidden1Dim <- [410]
-    hidden2Dim <- [90]
-    iter <- [40]
+    lstmDim <- [128,256,524]
+    hidden1Dim <- [128,256,410]
+    hidden2Dim <- [60,90,120]
+    iter <- [50,75,100]
     batchSize <- [264]
     return $ do
       -- | Grid search開始。ハイパーパラメータを設定。
